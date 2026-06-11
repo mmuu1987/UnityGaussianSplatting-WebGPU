@@ -101,8 +101,73 @@ The current codebase has a first WebGPU baseline path:
 - `Runtime/GaussianSplatRuntimeTuningPanel.cs` provides a development-build runtime tuning panel for WebGPU parameters. It appears automatically in development builds, can be toggled with F8, and can save/load values through `PlayerPrefs` so browser refreshes keep the same tuning values.
 - `Runtime/GaussianSplatRenderer.cs` skips `CSCalcViewData` on WebGPU because `RenderGaussianSplats.shader` calculates splat view data directly in the vertex shader for the baseline path.
 - `Shaders/RenderGaussianSplats.shader` has a WebGPU baseline path that reads packed splat data directly instead of relying on `_SplatViewData`.
+- The WebGPU runtime path now sanitizes runtime tuning values before culling/sorting, clamps invalid `PlayerPrefs` or Inspector values, rebuilds chunk culling data when cull padding changes, releases cached CPU positions when position caching is disabled, and explicitly disables edit/export operations on WebGPU builds.
+- The runtime tuning panel throttles scene-wide renderer discovery while visible, clamps slider output, validates loaded settings, and limits window dragging to the title area to reduce accidental camera/control conflicts.
+- `Runtime/GaussianSplatAssetBundleLoader.cs` and `Editor/GaussianSplatWebGpuPackageBuilder.cs` provide a minimal AssetBundle loading loop for Web builds. Scenes can remove the direct `GaussianSplatRenderer.Asset` reference, keep only a package id on the loader, download/load a bundle at runtime, assign the loaded `GaussianSplatAsset`, and reuse `GaussianSplatRenderer.LoadResourcesAsync` for throttled GPU upload.
 
 This is still only a bring-up path. Depth buckets are expected to be much faster than exact CPU sorting for large assets, but may have some ordering artifacts. If needed, Phase 2 can replace it with a WebGPU-compatible GPU sort.
+
+### Minimal WebGPU AssetBundle Loading Loop
+
+Objective: keep large Gaussian splat assets out of the Unity Web player data file and load them on demand.
+
+Current implementation:
+
+- `GaussianSplatAssetBundleLoader` can be added next to a `GaussianSplatRenderer`.
+- The loader resolves a bundle URL from either:
+  - `Bundle Url`, if explicitly set;
+  - or `Base Url` + `Bundle File Name`;
+  - or `StreamingAssets/GaussianSplatPackages/{PackageId}.bundle` when both are empty.
+- The loader downloads the bundle with `UnityWebRequestAssetBundle`, loads a `GaussianSplatAsset`, assigns it to the target renderer, then calls `LoadResourcesAsync`.
+- The renderer exposes `UnloadSplatResources(clearAssetReference)` so scene controllers can release the previous splat before switching packages.
+- WebGPU tools are placed under the top-level menu `Tools -> Gaussian WebGPU`, separated from the original/PC-oriented `Tools -> Gaussian Splats` menu.
+- The editor menu `Tools -> Gaussian WebGPU -> 资源包 -> 构建选中的GaussianSplatAsset到StreamingAssets` builds the selected `GaussianSplatAsset` directly into `Assets/StreamingAssets/GaussianSplatPackages/{PackageId}/{PackageId}.bundle`.
+- The editor menu `Tools -> Gaussian WebGPU -> 资源包 -> 构建选中的GaussianSplatAsset到自定义目录` keeps the manual output-folder workflow for testing or CDN staging.
+- The editor menu `Tools -> Gaussian WebGPU -> 资源包 -> 一键构建选中Renderer资源包并配置` is the closest one-click workflow: select scene renderers, build their assigned assets into StreamingAssets, configure loaders, then clear the direct renderer asset references.
+- The editor menu `Tools -> Gaussian WebGPU -> 资源包 -> 仅配置选中Renderer从资源包加载` adds/configures the loader on selected renderers and clears the direct `GaussianSplatRenderer.Asset` reference.
+- After a bundle build, the editor logs a size report with the bundle file size, raw Gaussian data size, compression ratio, splat count, build target, and per-section sizes for position, transform, color, SH, and chunk data. Use this report to decide whether the bottleneck is splat count, color data, or SH data.
+- `Editor/GaussianSplatWebGpuPlayerBuilder.cs` adds `Tools -> Gaussian WebGPU -> 发布 -> 构建WebGPU版本`, `构建并运行WebGPU版本`, and `运行上一次WebGPU构建`. These menus switch to WebGL if needed, try to set the graphics API to WebGPU only, run package preflight checks, then build to `Builds/WebGPU`.
+- `Runtime/GaussianSplatLoadingOverlay.cs` automatically displays a full-screen loading overlay while `GaussianSplatAssetBundleLoader` is downloading/loading/uploading Gaussian data. It reads loader status/progress, reports load errors, hides when all loaders are ready, and exposes `GaussianSplatLoadingOverlay.BlocksSceneInput` so scene/player controllers can pause movement during the point-cloud loading window.
+
+Recommended workflow:
+
+1. Select the scene object that has `GaussianSplatRenderer`.
+2. Run `Tools -> Gaussian WebGPU -> 资源包 -> 一键构建选中Renderer资源包并配置`.
+3. The generated `.bundle` is written directly under `Assets/StreamingAssets/GaussianSplatPackages/{PackageId}`.
+4. Confirm that `GaussianSplatRenderer.Asset` is empty and `GaussianSplatAssetBundleLoader.Bundle File Name` is `{PackageId}/{PackageId}.bundle`.
+5. Run `Tools -> Gaussian WebGPU -> 发布 -> 构建并运行WebGPU版本` for a local smoke test, or `构建WebGPU版本` for a normal build.
+6. The player build is written to `Builds/WebGPU`. The Unity player data should no longer include that direct Gaussian asset reference from the scene.
+
+Preflight checks before player build:
+
+- Warn when a scene `GaussianSplatRenderer.Asset` still has a direct asset reference.
+- Warn when a renderer has no `GaussianSplatAssetBundleLoader`.
+- Warn when `Load On Start` is disabled.
+- Warn when a default StreamingAssets bundle path is missing.
+
+Recommended scene controller integration:
+
+```csharp
+if (GaussianSplatting.Runtime.GaussianSplatLoadingOverlay.BlocksSceneInput)
+    return;
+```
+
+Place this near the top of camera/player input code, or inside `GaussianSceneController` before allowing player control. This keeps the sequence clean:
+
+1. User enters the scene.
+2. Loading UI appears.
+3. Static scene objects render normally.
+4. Gaussian bundle downloads and uploads to GPU.
+5. Loading UI hides when the splat renderer is ready.
+6. Player input is allowed.
+
+Acceptance criteria:
+
+- A scene can start with an empty `GaussianSplatRenderer.Asset` reference.
+- The loader can fetch and load a Gaussian splat bundle at runtime.
+- GPU upload still uses the existing per-frame throttled upload path.
+- Switching/unloading can release renderer GPU resources before loading the next package.
+- The first implementation does not need Addressables, versioned manifests, persistent browser cache management, or multi-package dependency resolution.
 
 ### Phase 1: WebGPU Baseline Viewer
 

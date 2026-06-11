@@ -27,6 +27,7 @@ namespace GaussianSplatting.Runtime
         bool m_CursorWasOverridden;
         bool m_PreviousCursorVisible;
         CursorLockMode m_PreviousLockState;
+        float m_NextRendererRefreshTime;
         readonly List<GaussianSplatRenderer> m_Renderers = new();
 
         public static bool BlocksCameraInput { get; private set; }
@@ -47,7 +48,7 @@ namespace GaussianSplatting.Runtime
         void Awake()
         {
             m_Visible = m_ShowOnStart;
-            RefreshRenderers();
+            RefreshRenderers(true);
             if (m_Target == null && m_Renderers.Count != 0)
                 m_Target = m_Renderers[0];
             if (m_LoadSavedOnStart && m_Target != null)
@@ -127,7 +128,7 @@ namespace GaussianSplatting.Runtime
             {
                 GUILayout.Label("No GaussianSplatRenderer found.");
                 GUILayout.EndVertical();
-                GUI.DragWindow();
+                GUI.DragWindow(new Rect(0, 0, 10000, 24));
                 return;
             }
 
@@ -192,8 +193,9 @@ namespace GaussianSplatting.Runtime
                 LogSettings(m_Target);
             GUILayout.EndHorizontal();
 
+            m_Target.SanitizeWebGpuOptions();
             GUILayout.EndVertical();
-            GUI.DragWindow();
+            GUI.DragWindow(new Rect(0, 0, 10000, 24));
         }
 
         void DrawTargetSelector()
@@ -201,7 +203,7 @@ namespace GaussianSplatting.Runtime
             GUILayout.BeginHorizontal();
             GUILayout.Label("Target", GUILayout.Width(48));
             if (GUILayout.Button("Refresh", GUILayout.Width(70)))
-                RefreshRenderers();
+                RefreshRenderers(true);
 
             if (m_Renderers.Count <= 1)
             {
@@ -220,8 +222,12 @@ namespace GaussianSplatting.Runtime
             GUILayout.EndHorizontal();
         }
 
-        void RefreshRenderers()
+        void RefreshRenderers(bool force = false)
         {
+            if (!force && Time.unscaledTime < m_NextRendererRefreshTime && m_Renderers.Count != 0)
+                return;
+
+            m_NextRendererRefreshTime = Time.unscaledTime + 0.5f;
             m_Renderers.Clear();
             m_Renderers.AddRange(FindObjectsOfType<GaussianSplatRenderer>());
             m_Renderers.RemoveAll(r => r == null);
@@ -235,13 +241,13 @@ namespace GaussianSplatting.Runtime
         static void DrawFloat(string label, ref float value, float min, float max, string help)
         {
             GUILayout.Label(new GUIContent($"{label}: {value:0.###}", help));
-            value = GUILayout.HorizontalSlider(value, min, max);
+            value = Mathf.Clamp(GUILayout.HorizontalSlider(value, min, max), min, max);
         }
 
         static void DrawInt(string label, ref int value, int min, int max, string help)
         {
             GUILayout.Label(new GUIContent($"{label}: {value:N0}", help));
-            value = Mathf.RoundToInt(GUILayout.HorizontalSlider(value, min, max));
+            value = Mathf.Clamp(Mathf.RoundToInt(GUILayout.HorizontalSlider(value, min, max)), min, max);
         }
 
         void DrawSortMode()
@@ -258,6 +264,7 @@ namespace GaussianSplatting.Runtime
         static void SaveSettings(GaussianSplatRenderer r)
         {
             if (r == null) return;
+            r.SanitizeWebGpuOptions();
             PlayerPrefs.SetInt(Key("SortOnChange"), r.m_WebGpuCpuSortOnlyWhenCameraChanges ? 1 : 0);
             PlayerPrefs.SetFloat(Key("SortPosThreshold"), r.m_WebGpuCpuSortPositionThreshold);
             PlayerPrefs.SetFloat(Key("SortAngleThreshold"), r.m_WebGpuCpuSortAngleThreshold);
@@ -301,6 +308,8 @@ namespace GaussianSplatting.Runtime
             r.m_WebGpuLodFarReservePercent = PlayerPrefs.GetInt(Key("LodFarReserve"), r.m_WebGpuLodFarReservePercent);
             r.m_SplatScale = PlayerPrefs.GetFloat(Key("SplatScale"), r.m_SplatScale);
             r.m_OpacityScale = PlayerPrefs.GetFloat(Key("OpacityScale"), r.m_OpacityScale);
+            r.SanitizeWebGpuOptions();
+            r.InvalidateWebGpuRuntimeState();
             Debug.Log("Gaussian WebGPU runtime tuning settings loaded.");
         }
 

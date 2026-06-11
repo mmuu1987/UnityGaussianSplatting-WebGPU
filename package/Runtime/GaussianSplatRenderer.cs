@@ -348,6 +348,7 @@ namespace GaussianSplatting.Runtime
         bool m_LoadingResources;
         bool m_SortFallbackLogged;
         bool m_CpuSortFallbackLogged;
+        bool m_WebGpuEditUnsupportedLogged;
         int[] m_KernelHandles;
         Vector3[] m_CpuSortPositions;
         CpuSortItem[] m_CpuSortItems;
@@ -369,10 +370,14 @@ namespace GaussianSplatting.Runtime
         bool[] m_CpuVisibleChunkSelected;
         int m_CpuVisibleChunkCount;
         Hash128 m_CpuChunkDataHash;
+        float m_CpuChunkCullPaddingCached = float.NaN;
         bool m_CpuChunkVisibilityValid;
 
         static readonly ProfilerMarker s_ProfSort = new(ProfilerCategory.Render, "GaussianSplat.Sort", MarkerFlags.SampleGPU);
         public const int kDefaultMaxUploadBytesPerFrame = 64 * 1024 * 1024;
+        const int kMinWebGpuCpuSortBucketCount = 16;
+        const int kMaxWebGpuCpuSortBucketCount = 65536;
+        const int kMaxWebGpuLodSampleStep = 1024;
         const uint kSortPartitionSize = 3840;
         const uint kSortRadix = 256;
         const uint kSortPasses = 4;
@@ -871,6 +876,82 @@ namespace GaussianSplatting.Runtime
             return SystemInfo.graphicsDeviceType.ToString() == "WebGPU";
         }
 
+        bool IsWebGpuRuntimeEditingUnsupported()
+        {
+            if (!IsWebGpuGraphicsDevice())
+                return false;
+
+            if (!m_WebGpuEditUnsupportedLogged)
+            {
+                Debug.LogWarning("Gaussian splat editing/export is disabled on the WebGPU runtime baseline path.", this);
+                m_WebGpuEditUnsupportedLogged = true;
+            }
+            return true;
+        }
+
+        static bool IsFinite(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value);
+        }
+
+        static bool ClampField(ref int value, int min, int max)
+        {
+            int clamped = Mathf.Clamp(value, min, max);
+            if (clamped == value)
+                return false;
+            value = clamped;
+            return true;
+        }
+
+        static bool ClampField(ref float value, float min, float max, float fallback)
+        {
+            float clamped = IsFinite(value) ? Mathf.Clamp(value, min, max) : fallback;
+            if (Mathf.Approximately(clamped, value))
+                return false;
+            value = clamped;
+            return true;
+        }
+
+        public void SanitizeWebGpuOptions()
+        {
+            if (m_WebGpuCpuSortMode != WebGpuCpuSortMode.DepthBuckets &&
+                m_WebGpuCpuSortMode != WebGpuCpuSortMode.Exact)
+            {
+                m_WebGpuCpuSortMode = WebGpuCpuSortMode.DepthBuckets;
+            }
+
+            ClampField(ref m_WebGpuCpuSortPositionThreshold, 0, 1000, 0.01f);
+            ClampField(ref m_WebGpuCpuSortAngleThreshold, 0, 180, 0.25f);
+            ClampField(ref m_WebGpuCpuSortBucketCount, kMinWebGpuCpuSortBucketCount, kMaxWebGpuCpuSortBucketCount);
+            ClampField(ref m_WebGpuChunkCullPadding, 0, 1000, 1.0f);
+            ClampField(ref m_WebGpuMaxVisibleSplats, 0, int.MaxValue);
+            ClampField(ref m_WebGpuLodNearDistance, 0, 100000, 25.0f);
+            ClampField(ref m_WebGpuLodFarDistance, 0, 100000, 80.0f);
+            if (m_WebGpuLodFarDistance < m_WebGpuLodNearDistance)
+                m_WebGpuLodFarDistance = m_WebGpuLodNearDistance;
+
+            ClampField(ref m_WebGpuLodMidSampleStep, 1, kMaxWebGpuLodSampleStep);
+            ClampField(ref m_WebGpuLodFarSampleStep, 1, kMaxWebGpuLodSampleStep);
+            ClampField(ref m_WebGpuLodMaxSampleStep, 1, kMaxWebGpuLodSampleStep);
+            m_WebGpuLodMaxSampleStep = Mathf.Max(m_WebGpuLodMaxSampleStep, Mathf.Max(m_WebGpuLodMidSampleStep, m_WebGpuLodFarSampleStep));
+            ClampField(ref m_WebGpuLodFarReservePercent, 0, 50);
+
+            ClampField(ref m_SplatScale, 0.1f, 2.0f, 1.0f);
+            ClampField(ref m_OpacityScale, 0.05f, 20.0f, 1.0f);
+        }
+
+        public void InvalidateWebGpuRuntimeState()
+        {
+            m_CpuSortHasLastState = false;
+            m_CpuChunkVisibilityValid = false;
+        }
+
+        void OnValidate()
+        {
+            SanitizeWebGpuOptions();
+            InvalidateWebGpuRuntimeState();
+        }
+
         void DispatchUtils(CommandBuffer cmb, KernelIndices kernel, int count)
         {
             int kernelIndex = GetKernelIndex(kernel);
@@ -1058,15 +1139,18 @@ namespace GaussianSplatting.Runtime
 
         bool EnsureCpuChunks()
         {
+            SanitizeWebGpuOptions();
             if (!TryGetCpuSortSourceData(out var posBytes, out int posStride, out var chunks, out bool hasChunks))
                 return false;
 
+            float chunkCullPadding = Mathf.Max(0, m_WebGpuChunkCullPadding);
             if (m_CpuChunks != null &&
                 m_CpuVisibleChunks != null &&
                 m_CpuVisibleChunkSampleSteps != null &&
                 m_CpuVisibleChunkCandidates != null &&
                 m_CpuVisibleChunkSelected != null &&
-                m_CpuChunkDataHash == m_Asset.dataHash)
+                m_CpuChunkDataHash == m_Asset.dataHash &&
+                Mathf.Approximately(m_CpuChunkCullPaddingCached, chunkCullPadding))
             {
                 return true;
             }
@@ -1115,9 +1199,8 @@ namespace GaussianSplatting.Runtime
                         }
                     }
 
-                    float padding = Mathf.Max(0, m_WebGpuChunkCullPadding);
-                    if (padding > 0)
-                        bounds.Expand(padding * 2.0f);
+                    if (chunkCullPadding > 0)
+                        bounds.Expand(chunkCullPadding * 2.0f);
 
                     m_CpuChunks[chunkIndex] = new CpuChunk
                     {
@@ -1126,6 +1209,7 @@ namespace GaussianSplatting.Runtime
                         bounds = bounds
                     };
                 }
+                m_CpuChunkCullPaddingCached = chunkCullPadding;
             }
             catch (OutOfMemoryException)
             {
@@ -1137,6 +1221,7 @@ namespace GaussianSplatting.Runtime
                 m_CpuVisibleChunkSelected = null;
                 m_CpuVisibleChunkCount = 0;
                 m_CpuChunkDataHash = default;
+                m_CpuChunkCullPaddingCached = float.NaN;
                 m_CpuChunkVisibilityValid = false;
                 return false;
             }
@@ -1229,6 +1314,7 @@ namespace GaussianSplatting.Runtime
 
         internal bool PrepareRenderForCamera(Camera cam, Matrix4x4 matrix)
         {
+            SanitizeWebGpuOptions();
             if (!ShouldUseWebGpuChunkCulling())
             {
                 bool changed = m_CpuChunkVisibilityValid || m_RenderSplatCount != m_SplatCount;
@@ -1329,10 +1415,14 @@ namespace GaussianSplatting.Runtime
 
         bool EnsureCpuSortCache()
         {
+            SanitizeWebGpuOptions();
             if (!TryGetCpuSortSourceData(out var posBytes, out int posStride, out var chunks, out bool hasChunks))
                 return false;
 
-            int bucketCount = Mathf.Max(16, m_WebGpuCpuSortBucketCount);
+            if (!m_WebGpuCpuSortCachePositions && m_CpuSortPositions != null)
+                m_CpuSortPositions = null;
+
+            int bucketCount = Mathf.Clamp(m_WebGpuCpuSortBucketCount, kMinWebGpuCpuSortBucketCount, kMaxWebGpuCpuSortBucketCount);
             bool usesBuckets = m_WebGpuCpuSortMode == WebGpuCpuSortMode.DepthBuckets;
             bool canReuseSortArrays = m_CpuSortKeys != null &&
                                       m_CpuSortKeys.Length == m_SplatCount &&
@@ -1697,6 +1787,14 @@ namespace GaussianSplatting.Runtime
 
         public bool CanUseExternalGpuResources => resourcesAreSetUp;
 
+        public void UnloadSplatResources(bool clearAssetReference = false)
+        {
+            DisposeResourcesForAsset();
+            if (clearAssetReference)
+                m_Asset = null;
+            UpdateLoadedAssetTracking();
+        }
+
         public void EnsureMaterials()
         {
             if (m_MatSplats == null && resourcesAreSetUp)
@@ -1826,6 +1924,7 @@ namespace GaussianSplatting.Runtime
             m_CpuVisibleChunkSelected = null;
             m_CpuVisibleChunkCount = 0;
             m_CpuChunkDataHash = default;
+            m_CpuChunkCullPaddingCached = float.NaN;
             m_CpuChunkVisibilityValid = false;
 
             m_SplatCount = 0;
@@ -2088,6 +2187,8 @@ namespace GaussianSplatting.Runtime
 
         bool EnsureEditingBuffers()
         {
+            if (IsWebGpuRuntimeEditingUnsupported())
+                return false;
             if (!HasValidAsset || !HasValidRenderSetup)
                 return false;
 
@@ -2115,6 +2216,8 @@ namespace GaussianSplatting.Runtime
 
         public void EditStorePosMouseDown()
         {
+            if (IsWebGpuRuntimeEditingUnsupported())
+                return;
             if (m_GpuEditPosMouseDown == null)
             {
                 m_GpuEditPosMouseDown = new GraphicsBuffer(m_GpuPosData.target | GraphicsBuffer.Target.CopyDestination, m_GpuPosData.count, m_GpuPosData.stride) {name = "GaussianSplatEditPosMouseDown"};
@@ -2123,6 +2226,8 @@ namespace GaussianSplatting.Runtime
         }
         public void EditStoreOtherMouseDown()
         {
+            if (IsWebGpuRuntimeEditingUnsupported())
+                return;
             if (m_GpuEditOtherMouseDown == null)
             {
                 m_GpuEditOtherMouseDown = new GraphicsBuffer(m_GpuOtherData.target | GraphicsBuffer.Target.CopyDestination, m_GpuOtherData.count, m_GpuOtherData.stride) {name = "GaussianSplatEditOtherMouseDown"};
@@ -2294,6 +2399,8 @@ namespace GaussianSplatting.Runtime
 
         public void EditSetSplatCount(int newSplatCount)
         {
+            if (IsWebGpuRuntimeEditingUnsupported())
+                return;
             if (newSplatCount <= 0 || newSplatCount > GaussianSplatAsset.kMaxSplats)
             {
                 Debug.LogError($"Invalid new splat count: {newSplatCount}");
@@ -2370,6 +2477,7 @@ namespace GaussianSplatting.Runtime
             m_CpuVisibleChunkSelected = null;
             m_CpuVisibleChunkCount = 0;
             m_CpuChunkDataHash = default;
+            m_CpuChunkCullPaddingCached = float.NaN;
             m_CpuChunkVisibilityValid = false;
             m_CpuSortHasLastState = false;
             editModified = true;
@@ -2377,6 +2485,9 @@ namespace GaussianSplatting.Runtime
 
         public void EditCopySplatsInto(GaussianSplatRenderer dst, int copySrcStartIndex, int copyDstStartIndex, int copyCount)
         {
+            if (dst == null || IsWebGpuRuntimeEditingUnsupported() || dst.IsWebGpuRuntimeEditingUnsupported())
+                return;
+
             EditCopySplats(
                 dst.transform,
                 dst.m_GpuPosData, dst.m_GpuOtherData, dst.m_GpuSHData, dst.m_GpuColorData, dst.m_GpuEditDeleted,
@@ -2392,6 +2503,8 @@ namespace GaussianSplatting.Runtime
             int dstSize,
             int copySrcStartIndex, int copyDstStartIndex, int copyCount)
         {
+            if (IsWebGpuRuntimeEditingUnsupported())
+                return;
             if (!EnsureEditingBuffers()) return;
 
             Matrix4x4 copyMatrix = dstTransform.worldToLocalMatrix * transform.localToWorldMatrix;
