@@ -10,7 +10,7 @@ namespace GaussianSplatting.Editor
 {
     static class GaussianSplatWebGpuPackageBuilder
     {
-        const string kDefaultPackageFolder = "Assets/StreamingAssets/GaussianSplatPackages";
+        const string kBundleAssetsFolder = "Assets/bundleAssets";
 
         [MenuItem("Tools/Gaussian WebGPU/资源包/一键构建选中Renderer资源包并配置")]
         static void BuildSelectedRendererAssetsToStreamingAssetsAndPrepareMenu()
@@ -24,19 +24,22 @@ namespace GaussianSplatting.Editor
             return GetSelectedRenderers().Count != 0;
         }
 
-        [MenuItem("Tools/Gaussian WebGPU/资源包/构建选中的GaussianSplatAsset到StreamingAssets")]
-        static void BuildSelectedGaussianSplatAssetBundleToStreamingAssets()
+        [MenuItem("Tools/Gaussian WebGPU/资源包/构建选中的GaussianSplatAsset到bundleAssets")]
+        static void BuildSelectedGaussianSplatAssetBundleToBundleAssets()
         {
             if (!TryGetSelectedGaussianSplatAsset(out var asset, out var assetPath))
                 return;
 
             string packageId = MakeSafePackageId(asset.name);
-            string outputFolder = GetStreamingAssetsPackageFolder(packageId);
+            string outputFolder = GetBundleAssetsPackageFolder(packageId);
+            if (!ClearBundleAssetsPackageFolder(packageId))
+                return;
+
             BuildGaussianSplatAssetBundle(asset, assetPath, outputFolder, packageId);
         }
 
-        [MenuItem("Tools/Gaussian WebGPU/资源包/构建选中的GaussianSplatAsset到StreamingAssets", true)]
-        static bool CanBuildSelectedGaussianSplatAssetBundleToStreamingAssets()
+        [MenuItem("Tools/Gaussian WebGPU/资源包/构建选中的GaussianSplatAsset到bundleAssets", true)]
+        static bool CanBuildSelectedGaussianSplatAssetBundleToBundleAssets()
         {
             return Selection.activeObject is GaussianSplatAsset;
         }
@@ -49,7 +52,7 @@ namespace GaussianSplatting.Editor
 
             string outputFolder = EditorUtility.SaveFolderPanel(
                 "选择Gaussian WebGPU资源包输出目录",
-                Directory.Exists(kDefaultPackageFolder) ? kDefaultPackageFolder : "Assets",
+                Directory.Exists(kBundleAssetsFolder) ? kBundleAssetsFolder : "Assets",
                 "");
             if (string.IsNullOrEmpty(outputFolder))
                 return;
@@ -64,8 +67,11 @@ namespace GaussianSplatting.Editor
             return Selection.activeObject is GaussianSplatAsset;
         }
 
-        static void BuildGaussianSplatAssetBundle(GaussianSplatAsset asset, string assetPath, string outputFolder, string packageId)
+        static bool BuildGaussianSplatAssetBundle(GaussianSplatAsset asset, string assetPath, string outputFolder, string packageId)
         {
+            if (!EnsureWebGlBuildTarget())
+                return false;
+
             Directory.CreateDirectory(outputFolder);
             string bundleName = packageId + ".bundle";
             var build = new AssetBundleBuild
@@ -78,17 +84,34 @@ namespace GaussianSplatting.Editor
                 outputFolder,
                 new[] { build },
                 BuildAssetBundleOptions.ChunkBasedCompression,
-                EditorUserBuildSettings.activeBuildTarget);
+                BuildTarget.WebGL);
 
             if (manifest == null)
             {
                 EditorUtility.DisplayDialog("构建Gaussian WebGPU资源包", "AssetBundle构建失败，请查看Unity Console里的详细错误。", "确定");
-                return;
+                return false;
             }
 
             AssetDatabase.Refresh();
             string bundlePath = Path.Combine(outputFolder, bundleName);
             Debug.Log(BuildSizeReport(asset, bundlePath), asset);
+            return true;
+        }
+
+        static bool EnsureWebGlBuildTarget()
+        {
+            if (EditorUserBuildSettings.activeBuildTarget == BuildTarget.WebGL)
+                return true;
+
+            bool switchTarget = EditorUtility.DisplayDialog(
+                "构建Gaussian WebGPU资源包",
+                "当前Build Target不是WebGL。WebGPU资源包必须使用WebGL目标平台构建，否则浏览器能下载但无法打开AssetBundle。\n\n是否现在切换到WebGL？",
+                "切换到WebGL",
+                "取消");
+            if (!switchTarget)
+                return false;
+
+            return EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.WebGL, BuildTarget.WebGL);
         }
 
         static bool TryGetSelectedGaussianSplatAsset(out GaussianSplatAsset asset, out string assetPath)
@@ -129,14 +152,11 @@ namespace GaussianSplatting.Editor
 
                 ConfigureLoader(loader, renderer, asset, packageId);
 
-                Undo.RecordObject(renderer, "清空直接GaussianSplatAsset引用");
-                renderer.m_Asset = null;
                 EditorUtility.SetDirty(loader);
-                EditorUtility.SetDirty(renderer);
                 ++prepared;
             }
 
-            Debug.Log($"已配置 {prepared} 个GaussianSplatRenderer从WebGPU资源包加载。默认资源包目录：{kDefaultPackageFolder}");
+            Debug.Log($"已配置 {prepared} 个GaussianSplatRenderer从WebGPU资源包加载。资源包源目录：{kBundleAssetsFolder}");
         }
 
         static void BuildSelectedRendererAssetsToStreamingAssetsAndPrepare()
@@ -164,8 +184,12 @@ namespace GaussianSplatting.Editor
 
                 var loader = renderer.GetComponent<GaussianSplatAssetBundleLoader>();
                 string packageId = GetRendererPackageId(renderer, loader, asset);
-                string outputFolder = GetStreamingAssetsPackageFolder(packageId);
-                BuildGaussianSplatAssetBundle(asset, assetPath, outputFolder, packageId);
+                string outputFolder = GetBundleAssetsPackageFolder(packageId);
+                if (!ClearBundleAssetsPackageFolder(packageId))
+                    continue;
+
+                if (!BuildGaussianSplatAssetBundle(asset, assetPath, outputFolder, packageId))
+                    continue;
 
                 if (loader == null)
                     loader = Undo.AddComponent<GaussianSplatAssetBundleLoader>(renderer.gameObject);
@@ -174,14 +198,11 @@ namespace GaussianSplatting.Editor
 
                 ConfigureLoader(loader, renderer, asset, packageId);
 
-                Undo.RecordObject(renderer, "清空直接GaussianSplatAsset引用");
-                renderer.m_Asset = null;
                 EditorUtility.SetDirty(loader);
-                EditorUtility.SetDirty(renderer);
                 ++built;
             }
 
-            Debug.Log($"已构建并配置 {built} 个GaussianSplatRenderer资源包。输出目录：{kDefaultPackageFolder}");
+            Debug.Log($"已构建并配置 {built} 个GaussianSplatRenderer资源包。输出目录：{kBundleAssetsFolder}");
         }
 
         [MenuItem("Tools/Gaussian WebGPU/资源包/仅配置选中Renderer从资源包加载", true)]
@@ -209,9 +230,40 @@ namespace GaussianSplatting.Editor
             return result;
         }
 
-        static string GetStreamingAssetsPackageFolder(string packageId)
+        static string GetBundleAssetsPackageFolder(string packageId)
         {
-            return $"{kDefaultPackageFolder}/{packageId}";
+            return $"{kBundleAssetsFolder}/{packageId}";
+        }
+
+        static bool ClearBundleAssetsPackageFolder(string packageId)
+        {
+            string packageFolderAssetPath = GetBundleAssetsPackageFolder(packageId);
+            string packageFolder = Path.GetFullPath(packageFolderAssetPath);
+            string bundleAssetsFolder = Path.GetFullPath(kBundleAssetsFolder);
+            if (!IsChildPath(bundleAssetsFolder, packageFolder))
+            {
+                Debug.LogError($"拒绝清理 bundleAssets 之外的 Gaussian WebGPU 资源包目录：{packageFolder}");
+                return false;
+            }
+
+            if (AssetDatabase.IsValidFolder(packageFolderAssetPath))
+            {
+                AssetDatabase.DeleteAsset(packageFolderAssetPath);
+                AssetDatabase.Refresh();
+            }
+            else if (Directory.Exists(packageFolder))
+            {
+                Directory.Delete(packageFolder, true);
+                string metaPath = packageFolder + ".meta";
+                if (File.Exists(metaPath))
+                    File.Delete(metaPath);
+                AssetDatabase.Refresh();
+            }
+
+            Directory.CreateDirectory(packageFolder);
+            AssetDatabase.Refresh();
+            Debug.Log($"已清理同名 Gaussian WebGPU 资源包缓存：{packageFolderAssetPath}");
+            return true;
         }
 
         static string GetStreamingAssetsPackageRelativeBundlePath(string packageId)
@@ -252,6 +304,13 @@ namespace GaussianSplatting.Editor
             return new string(chars);
         }
 
+        static bool IsChildPath(string parentPath, string childPath)
+        {
+            string safeParentPath = Path.GetFullPath(parentPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            string safeChildPath = Path.GetFullPath(childPath);
+            return safeChildPath.StartsWith(safeParentPath, System.StringComparison.OrdinalIgnoreCase);
+        }
+
         static string BuildSizeReport(GaussianSplatAsset asset, string bundlePath)
         {
             long posBytes = GetTextAssetSize(asset.posData);
@@ -266,7 +325,7 @@ namespace GaussianSplatting.Editor
             return
                 "Gaussian WebGPU资源包构建完成\n" +
                 $"路径：{bundlePath}\n" +
-                $"构建目标：{EditorUserBuildSettings.activeBuildTarget}\n" +
+                $"构建目标：{BuildTarget.WebGL}\n" +
                 $"Splat数量：{asset.splatCount:N0}\n" +
                 $"Bundle大小：{FormatBytes(bundleBytes)}\n" +
                 $"原始Gaussian数据：{FormatBytes(sourceBytes)}\n" +

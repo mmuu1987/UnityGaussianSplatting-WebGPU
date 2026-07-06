@@ -12,7 +12,7 @@ namespace GaussianSplatting.Runtime
     [DefaultExecutionOrder(9000)]
     public class GaussianSplatLoadingOverlay : MonoBehaviour
     {
-        public static bool s_AutoCreateEnabled = true;
+        public static bool s_AutoCreateEnabled = false;
 
         public bool m_ShowWhenLoadersExist;
         public bool m_AutoHideWhenReady = true;
